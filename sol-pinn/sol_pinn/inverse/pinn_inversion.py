@@ -77,9 +77,70 @@ class InversePINNSolver(PINNSolver):
 
         return max(gamma, 0.1)
 
+    def diagnose_gamma_from_window(self, window_ratio=0.1, n_points=32,
+                                   reduction="median"):
+        """Recover gamma from a target-near window instead of one derivative.
+
+        The single-point sheath diagnosis is sensitive to noise in
+        ``dT/ds(L)``.  For zero-source test cases the conductive heat flux is
+        constant, so the target sheath relation can be evaluated from several
+        near-target flux estimates:
+
+            gamma = q / (C * sqrt(T(L)))
+
+        where ``q = -kappa_parallel * T^(5/2) * dT/ds`` and
+        ``C = e^(3/2) * p0 / (2 * sqrt(m_i))``.
+        """
+        if not (0.0 < window_ratio <= 1.0):
+            raise ValueError("window_ratio must be in (0, 1].")
+        if n_points < 2:
+            raise ValueError("n_points must be at least 2.")
+
+        start = self.config.L * (1.0 - window_ratio)
+        s_window = torch.linspace(
+            start,
+            self.config.L,
+            n_points,
+            dtype=torch.float32,
+            device=self.device,
+        ).reshape(-1, 1)
+        s_window.requires_grad_(True)
+
+        with torch.enable_grad():
+            T = self.model(s_window)
+        dT_ds = torch.autograd.grad(
+            T, s_window, grad_outputs=torch.ones_like(T), create_graph=True,
+        )[0]
+
+        q = -self.config.kappa_parallel * torch.clamp(T, min=1e-8) ** 2.5 * dT_ds
+
+        s_L = torch.tensor([[self.config.L]], dtype=torch.float32, device=self.device)
+        with torch.no_grad():
+            T_L = torch.clamp(self.model(s_L), min=1e-8)
+
+        C = E_CHARGE ** 1.5 * self.config.p0 / (2.0 * np.sqrt(M_I))
+        gamma_values = q / (C * torch.sqrt(T_L))
+        gamma_values = gamma_values.detach().cpu().numpy().reshape(-1)
+        gamma_values = gamma_values[np.isfinite(gamma_values)]
+        if gamma_values.size == 0:
+            return 0.1
+
+        if reduction == "mean":
+            gamma = float(np.mean(gamma_values))
+        elif reduction == "median":
+            gamma = float(np.median(gamma_values))
+        else:
+            raise ValueError("reduction must be 'median' or 'mean'.")
+
+        return max(gamma, 0.1)
+
     def train_with_inversion(self, s_colloc, s_obs, T_obs, n_adam=5000,
                              n_lbfgs=300, gamma_lr=1e-3,
-                             sheath_weight=0.0):
+                             sheath_weight=0.0,
+                             diagnosis="window",
+                             diagnosis_window_ratio=0.1,
+                             data_loss_type="huber",
+                             data_delta=None):
         """Train the PINN and then diagnose gamma from the sheath boundary.
 
         The default choice ``sheath_weight=0`` avoids biasing the temperature field
@@ -90,6 +151,8 @@ class InversePINNSolver(PINNSolver):
         s_colloc = s_colloc.to(self.device)
         s_obs = s_obs.to(self.device)
         T_obs = T_obs.to(self.device)
+        if data_delta is None:
+            data_delta = 0.02 * self.config.T_up
 
         self.trainer.loss_weights["data"] = 1.0
         self.trainer.loss_weights["sheath"] = sheath_weight
@@ -103,7 +166,13 @@ class InversePINNSolver(PINNSolver):
             optimizer.zero_grad()
             L_pde = pde_loss(self.model, s_colloc, self.config)
             L_up = upstream_loss(self.model, self.config)
-            L_data = data_loss(self.model, s_obs, T_obs)
+            L_data = data_loss(
+                self.model,
+                s_obs,
+                T_obs,
+                loss_type=data_loss_type,
+                delta=data_delta,
+            )
 
             w = self.trainer.loss_weights
             total = (
@@ -123,14 +192,29 @@ class InversePINNSolver(PINNSolver):
                 print(f"  [{step}] data={L_data.item():.2e} pde={L_pde.item():.2e}")
 
         self._train_lbfgs_with_data(
-            s_colloc, s_obs, T_obs, n_lbfgs, sheath_weight=sheath_weight,
+            s_colloc,
+            s_obs,
+            T_obs,
+            n_lbfgs,
+            sheath_weight=sheath_weight,
+            data_loss_type=data_loss_type,
+            data_delta=data_delta,
         )
 
-        self._diagnosed_gamma = self.diagnose_gamma_from_sheath()
+        if diagnosis == "window":
+            self._diagnosed_gamma = self.diagnose_gamma_from_window(
+                window_ratio=diagnosis_window_ratio,
+            )
+        elif diagnosis == "sheath":
+            self._diagnosed_gamma = self.diagnose_gamma_from_sheath()
+        else:
+            raise ValueError("diagnosis must be 'window' or 'sheath'.")
         print(f"  Diagnosed gamma: {self._diagnosed_gamma:.4f} (init={self.gamma_init})")
 
     def _train_lbfgs_with_data(self, s_colloc, s_obs, T_obs, n_iter,
-                               sheath_weight=0.0):
+                               sheath_weight=0.0,
+                               data_loss_type="mse",
+                               data_delta=1.0):
         """Refine the inversion solution with L-BFGS."""
         optimizer = torch.optim.LBFGS(
             self.model.parameters(),
@@ -155,6 +239,8 @@ class InversePINNSolver(PINNSolver):
                 None,
                 s_data=s_obs,
                 T_data=T_obs,
+                data_loss_type=data_loss_type,
+                data_delta=data_delta,
             )
             losses["total"].backward()
             return losses["total"]

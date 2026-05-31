@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from sol_pinn.physics.params import SOLConfig
-from sol_pinn.pinn.loss import combined_loss, pde_loss, sheath_loss, upstream_loss
+from sol_pinn.pinn.loss import combined_loss, data_loss, pde_loss, sheath_loss, upstream_loss
 from sol_pinn.pinn.network import FourierFeatureEncoding, PINN, PiecewisePINN, TransformedPINN
 from sol_pinn.pinn.pinn_solver import PINNSolver
 from sol_pinn.pinn.trainer import CausalTrainer
@@ -162,6 +162,25 @@ class TestLoss:
         )
 
         assert losses_high["total"].item() != losses_low["total"].item()
+
+    def test_huber_data_loss_reduces_outlier_penalty(self):
+        class ConstantModel(torch.nn.Module):
+            def forward(self, s):
+                return torch.zeros_like(s)
+
+        s_data = torch.tensor([[0.0], [1.0]])
+        T_data = torch.tensor([[0.1], [10.0]])
+
+        mse = data_loss(ConstantModel(), s_data, T_data, loss_type="mse")
+        huber = data_loss(
+            ConstantModel(),
+            s_data,
+            T_data,
+            loss_type="huber",
+            delta=1.0,
+        )
+
+        assert huber < mse
 
 
 class TestCausalTrainer:
