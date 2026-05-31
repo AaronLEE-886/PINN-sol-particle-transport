@@ -100,6 +100,30 @@ class TestDiagnoseGamma:
 
         assert abs(gamma - 7.0) < 0.1
 
+    def test_trainable_sheath_loss_prefers_true_gamma(self):
+        """The differentiable sheath loss should be minimized near true gamma."""
+        config = SOLConfig(T_up=80.0, gamma_sheath=7.0)
+        from fd_reference.numerical.fd_solver import FDSolver
+        from sol_pinn.physics.params import SolverConfig
+
+        fd = FDSolver(config, SolverConfig(n_points=2000, max_iter=2000, tol=1e-10))
+        result = fd.solve()
+        T_L = float(result["T"][-1])
+        q = config.alpha * np.sqrt(T_L)
+
+        class ExactProfile(torch.nn.Module):
+            def forward(self, s):
+                T_power = config.T_up ** 3.5 - 3.5 * q / config.kappa_parallel * s
+                return torch.pow(T_power, 2.0 / 7.0)
+
+        solver = InversePINNSolver(config, gamma_init=5.0, use_fourier=False)
+        solver.model = ExactProfile()
+
+        true_loss = solver.trainable_sheath_loss(torch.log(torch.tensor(7.0)))
+        wrong_loss = solver.trainable_sheath_loss(torch.log(torch.tensor(5.0)))
+
+        assert true_loss < wrong_loss
+
 
 class TestInversionPipeline:
     """Test the full inversion pipeline."""
@@ -180,3 +204,20 @@ class TestLeastSquaresBaseline:
 
         assert T.shape == s_eval.shape
         assert np.all(np.isfinite(T))
+
+    def test_least_squares_initialization_sets_gamma_near_truth(self):
+        config = SOLConfig(T_up=80.0, gamma_sheath=7.0)
+        from fd_reference.numerical.fd_solver import FDSolver
+        from sol_pinn.physics.params import SolverConfig
+        from sol_pinn.utils.sampling import uniform_grid
+
+        fd = FDSolver(config, SolverConfig(n_points=1000, max_iter=2000, tol=1e-10))
+        result = fd.solve()
+        s_obs = uniform_grid(10, config.L)
+        T_obs = np.interp(s_obs, result["s"], result["T"])
+
+        solver = InversePINNSolver(config, gamma_init=5.0, use_fourier=False)
+        gamma = solver.initialize_gamma_from_least_squares(s_obs, T_obs)
+
+        assert abs(gamma - 7.0) < 0.1
+        assert abs(solver.current_gamma - gamma) < 1e-6

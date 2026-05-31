@@ -40,11 +40,91 @@ class InversePINNSolver(PINNSolver):
         super().__init__(config_with_gamma, **kwargs)
         self.gamma_init = gamma_init
         self._diagnosed_gamma = None
+        self.gamma_parameter = GammaParameter(gamma_init).to(self.device)
 
     @property
     def current_gamma(self):
         """Return the diagnosed gamma when available, otherwise the initial guess."""
         return self._diagnosed_gamma if self._diagnosed_gamma is not None else self.gamma_init
+
+    def initialize_gamma_from_least_squares(self, s_obs, T_obs,
+                                            gamma_guess=(5.0, 10.0)):
+        """Initialize trainable gamma from the FD least-squares baseline."""
+        from .least_squares import least_squares_inversion
+
+        if isinstance(s_obs, torch.Tensor):
+            s_obs = s_obs.detach().cpu().numpy().reshape(-1)
+        else:
+            s_obs = np.asarray(s_obs, dtype=float).reshape(-1)
+        if isinstance(T_obs, torch.Tensor):
+            T_obs = T_obs.detach().cpu().numpy().reshape(-1)
+        else:
+            T_obs = np.asarray(T_obs, dtype=float).reshape(-1)
+
+        gamma, _ = least_squares_inversion(
+            s_obs,
+            T_obs,
+            self.config,
+            gamma_guess=gamma_guess,
+        )
+        gamma = max(float(gamma), 0.1)
+
+        with torch.no_grad():
+            self.gamma_parameter.log_gamma.copy_(
+                torch.log(torch.tensor(gamma, dtype=torch.float32, device=self.device))
+            )
+        self.gamma_init = gamma
+        self.config = self.config.clone_with(gamma_sheath=gamma)
+        self.trainer.config = self.config
+        self._diagnosed_gamma = gamma
+        return gamma
+
+    def trainable_sheath_loss(self, log_gamma, n_points=1,
+                              window_ratio=0.0) -> torch.Tensor:
+        """Return a differentiable sheath loss for a trainable gamma.
+
+        This loss lets inversion optimize ``gamma`` jointly with the
+        temperature network instead of estimating it from a post-training
+        derivative.  A small target-near window can be used to stabilize cases
+        with steep target gradients.
+        """
+        gamma = torch.exp(log_gamma)
+        if n_points < 1:
+            raise ValueError("n_points must be at least 1.")
+        if window_ratio < 0.0 or window_ratio > 1.0:
+            raise ValueError("window_ratio must be in [0, 1].")
+
+        if n_points == 1:
+            s = torch.tensor(
+                [[self.config.L]],
+                dtype=torch.float32,
+                requires_grad=True,
+                device=self.device,
+            )
+        else:
+            start = self.config.L * (1.0 - window_ratio)
+            s = torch.linspace(
+                start,
+                self.config.L,
+                n_points,
+                dtype=torch.float32,
+                device=self.device,
+            ).reshape(-1, 1)
+            s.requires_grad_(True)
+
+        T = self.model(s)
+        dT_ds = torch.autograd.grad(
+            T, s, grad_outputs=torch.ones_like(T), create_graph=True,
+        )[0]
+
+        T_safe = torch.clamp(T, min=1e-8)
+        C = E_CHARGE ** 1.5 * self.config.p0 / (2.0 * np.sqrt(M_I))
+        residual = (
+            self.config.kappa_parallel * T_safe ** 2.5 * dT_ds
+            + gamma * C * torch.sqrt(T_safe)
+        )
+        scale = C * np.sqrt(self.config.T_up)
+        return torch.mean(residual ** 2) / (scale ** 2 + 1e-30)
 
     def diagnose_gamma_from_sheath(self):
         """Recover gamma from the target sheath boundary condition.
@@ -210,6 +290,177 @@ class InversePINNSolver(PINNSolver):
         else:
             raise ValueError("diagnosis must be 'window' or 'sheath'.")
         print(f"  Diagnosed gamma: {self._diagnosed_gamma:.4f} (init={self.gamma_init})")
+
+    def train_with_joint_inversion(self, s_colloc, s_obs, T_obs,
+                                   n_adam=5000, n_lbfgs=300,
+                                   gamma_lr=5e-3,
+                                   joint_sheath_weight=1.0,
+                                   data_loss_type="huber",
+                                   data_delta=None,
+                                   sheath_window_points=8,
+                                   sheath_window_ratio=0.05,
+                                   gamma_prior=None,
+                                   gamma_prior_weight=0.0):
+        """Jointly optimize the PINN temperature field and sheath gamma.
+
+        This is intended for noisy or steep-gradient target cases where
+        post-training gradient diagnosis is fragile.
+        """
+        s_colloc = s_colloc.to(self.device)
+        s_obs = s_obs.to(self.device)
+        T_obs = T_obs.to(self.device)
+        if data_delta is None:
+            data_delta = 0.02 * self.config.T_up
+
+        from ..pinn.loss import data_loss, pde_loss, upstream_loss
+        from tqdm import tqdm
+
+        model_params = list(self.model.parameters())
+        optimizer = torch.optim.Adam(
+            [
+                {"params": model_params, "lr": self.trainer.lr},
+                {"params": self.gamma_parameter.parameters(), "lr": gamma_lr},
+            ],
+        )
+
+        self._gamma_history = []
+        if gamma_prior is not None:
+            log_gamma_prior = torch.log(
+                torch.tensor(float(gamma_prior), dtype=torch.float32, device=self.device)
+            )
+        else:
+            log_gamma_prior = None
+
+        for step in tqdm(range(n_adam), desc="Joint-Inversion-Adam"):
+            optimizer.zero_grad()
+            L_pde = pde_loss(self.model, s_colloc, self.config)
+            L_up = upstream_loss(self.model, self.config)
+            L_data = data_loss(
+                self.model,
+                s_obs,
+                T_obs,
+                loss_type=data_loss_type,
+                delta=data_delta,
+            )
+            L_sheath = self.trainable_sheath_loss(
+                self.gamma_parameter.log_gamma,
+                n_points=sheath_window_points,
+                window_ratio=sheath_window_ratio,
+            )
+            total = L_pde + L_up + L_data + joint_sheath_weight * L_sheath
+            if log_gamma_prior is not None and gamma_prior_weight > 0:
+                total = total + gamma_prior_weight * (
+                    self.gamma_parameter.log_gamma - log_gamma_prior
+                ) ** 2
+            total.backward()
+            optimizer.step()
+
+            if step % 500 == 0:
+                gamma_val = float(self.gamma_parameter.gamma.detach().cpu())
+                self._gamma_history.append(gamma_val)
+                print(
+                    f"  [{step}] gamma={gamma_val:.4f} "
+                    f"data={L_data.item():.2e} sheath={L_sheath.item():.2e}"
+                )
+
+        self._train_lbfgs_joint(
+            s_colloc,
+            s_obs,
+            T_obs,
+            n_lbfgs,
+            joint_sheath_weight=joint_sheath_weight,
+            data_loss_type=data_loss_type,
+            data_delta=data_delta,
+            sheath_window_points=sheath_window_points,
+            sheath_window_ratio=sheath_window_ratio,
+            gamma_prior=gamma_prior,
+            gamma_prior_weight=gamma_prior_weight,
+        )
+        self._diagnosed_gamma = float(self.gamma_parameter.gamma.detach().cpu())
+        self._gamma_history.append(self._diagnosed_gamma)
+        print(f"  Joint gamma: {self._diagnosed_gamma:.4f} (init={self.gamma_init})")
+
+    def _train_lbfgs_joint(self, s_colloc, s_obs, T_obs, n_iter,
+                           joint_sheath_weight=1.0,
+                           data_loss_type="huber",
+                           data_delta=1.0,
+                           sheath_window_points=8,
+                           sheath_window_ratio=0.05,
+                           gamma_prior=None,
+                           gamma_prior_weight=0.0):
+        """Refine joint inversion with L-BFGS."""
+        if n_iter <= 0:
+            return
+
+        from ..pinn.loss import data_loss, pde_loss, upstream_loss
+
+        params = list(self.model.parameters()) + list(self.gamma_parameter.parameters())
+        if gamma_prior is not None:
+            log_gamma_prior = torch.log(
+                torch.tensor(float(gamma_prior), dtype=torch.float32, device=self.device)
+            )
+        else:
+            log_gamma_prior = None
+
+        optimizer = torch.optim.LBFGS(
+            params,
+            lr=0.1,
+            max_iter=n_iter,
+            max_eval=n_iter * 2,
+            tolerance_grad=1e-12,
+            tolerance_change=1e-12,
+            line_search_fn="strong_wolfe",
+        )
+
+        def closure():
+            optimizer.zero_grad()
+            total = (
+                pde_loss(self.model, s_colloc, self.config)
+                + upstream_loss(self.model, self.config)
+                + data_loss(
+                    self.model,
+                    s_obs,
+                    T_obs,
+                    loss_type=data_loss_type,
+                    delta=data_delta,
+                )
+                + joint_sheath_weight * self.trainable_sheath_loss(
+                    self.gamma_parameter.log_gamma,
+                    n_points=sheath_window_points,
+                    window_ratio=sheath_window_ratio,
+                )
+            )
+            if log_gamma_prior is not None and gamma_prior_weight > 0:
+                total = total + gamma_prior_weight * (
+                    self.gamma_parameter.log_gamma - log_gamma_prior
+                ) ** 2
+            total.backward()
+            return total
+
+        optimizer.step(closure)
+
+    def train_with_hybrid_inversion(self, s_colloc, s_obs, T_obs,
+                                    gamma_guess=(5.0, 10.0),
+                                    gamma_prior_weight=20.0,
+                                    **kwargs):
+        """Use LS to initialize gamma, then refine with joint PINN inversion."""
+        gamma_prior = self.initialize_gamma_from_least_squares(
+            s_obs,
+            T_obs,
+            gamma_guess=gamma_guess,
+        )
+        kwargs.setdefault("gamma_lr", 1e-3)
+        kwargs.setdefault("joint_sheath_weight", 0.1)
+        kwargs.setdefault("n_lbfgs", 0)
+        self._diagnosed_gamma = None
+        self.train_with_joint_inversion(
+            s_colloc,
+            s_obs,
+            T_obs,
+            gamma_prior=gamma_prior,
+            gamma_prior_weight=gamma_prior_weight,
+            **kwargs,
+        )
 
     def _train_lbfgs_with_data(self, s_colloc, s_obs, T_obs, n_iter,
                                sheath_weight=0.0,
