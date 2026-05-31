@@ -8,7 +8,7 @@
 
 ## 控制方程
 
-稳态 SOL 平行输运由非线性热传导方程描述：
+稳态 SOL 平行输运由非线性热传导方程的描述：
 
 $$
 \frac{d}{ds}\left(\kappa_\parallel T^{5/2} \frac{dT}{ds}\right) + S(s) = 0, \quad s \in [0, L]
